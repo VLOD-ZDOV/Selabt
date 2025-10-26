@@ -1,4 +1,4 @@
-use anyhow::Result;  // Убрали Context
+use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
 use crossterm::{
@@ -9,7 +9,7 @@ use crossterm::{
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, List, ListItem, Paragraph, Tabs,
@@ -18,39 +18,36 @@ use ratatui::{
 };
 use std::{
     io,
-    process::{Command, Output},
     time::{Duration, Instant},
 };
 
-// Модули приложения
 mod avc;
 mod booleans;
 mod modules;
 mod rollback;
 mod safe_config;
 mod state;
+mod file_contexts;
+mod ports;
 
-// Убрали неиспользуемые импорты
-use avc::{AVCManager, AVCSeverity};
+use avc::{AVCManager, AVCSeverity, AVCSolution};
 use booleans::BooleanManager;
 use modules::ModuleManager;
 use rollback::{RollbackManager, SystemState};
 use safe_config::SafeModeConfig;
 use state::{AppState, CurrentView};
+use file_contexts::{FileContext, FileContextManager}; // Added FileContextManager
+use ports::{PortContext, PortManager}; // Added PortManager
 
-/// SELinux Assistant - Interactive TUI management tool
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Start in simulation mode (no real changes)
     #[arg(short, long)]
     simulate: bool,
 
-    /// Log file to analyze
     #[arg(short, long)]
     logfile: Option<String>,
 
-    /// Enable debug output
     #[arg(short, long)]
     debug: bool,
 }
@@ -62,6 +59,8 @@ struct App {
     boolean_manager: BooleanManager,
     rollback_manager: RollbackManager,
     safe_config: SafeModeConfig,
+    file_context_manager: FileContextManager,
+    port_manager: PortManager,
     last_update: Instant,
     update_interval: Duration,
     should_quit: bool,
@@ -79,6 +78,8 @@ impl App {
             boolean_manager: BooleanManager::new(),
             rollback_manager: RollbackManager::new(),
             safe_config: SafeModeConfig::default(),
+            file_context_manager: FileContextManager::new(),
+            port_manager: PortManager::new(),
             last_update: Instant::now(),
             update_interval: Duration::from_secs(5),
             should_quit: false,
@@ -87,7 +88,6 @@ impl App {
             simulation_mode: simulation,
         };
 
-        // Загружаем начальное состояние
         app.refresh_data()?;
         Ok(app)
     }
@@ -102,29 +102,46 @@ impl App {
     }
 
     fn load_real_data(&mut self) -> Result<()> {
-        // Загружаем AVC логи
         if let Err(e) = self.avc_manager.load_avc_logs() {
             self.set_status(format!("Failed to load AVC logs: {}", e), Color::Red);
         }
 
-        // Загружаем модули
         if let Err(e) = self.module_manager.load_modules() {
             self.set_status(format!("Failed to load modules: {}", e), Color::Red);
         }
 
-        // Загружаем boolean'ы
         if let Err(e) = self.boolean_manager.load_booleans() {
             self.set_status(format!("Failed to load booleans: {}", e), Color::Red);
+        }
+
+        if let Err(e) = self.file_context_manager.load_file_contexts() {
+            self.set_status(format!("Failed to load file contexts: {}", e), Color::Red);
+        }
+
+        if let Err(e) = self.port_manager.load_ports() {
+            self.set_status(format!("Failed to load ports: {}", e), Color::Red);
         }
 
         Ok(())
     }
 
     fn load_simulation_data(&mut self) -> Result<()> {
-        // Симуляционные данные для тестирования
         self.avc_manager.load_simulation_data();
         self.module_manager.load_simulation_data();
         self.boolean_manager.load_simulation_data();
+        self.file_context_manager.contexts = vec![
+            FileContext {
+                path: "/var/www/html".to_string(),
+                context: "httpd_sys_content_t".to_string(),
+            },
+        ];
+        self.port_manager.ports = vec![
+            PortContext {
+                port: "80".to_string(),
+                protocol: "tcp".to_string(),
+                context: "http_port_t".to_string(),
+            },
+        ];
         Ok(())
     }
 
@@ -149,9 +166,6 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.state.next_item();
             }
-            KeyCode::Enter => {
-                self.execute_current_selection()?;
-            }
             KeyCode::Char('r') => {
                 self.rollback_last_change()?;
             }
@@ -168,6 +182,8 @@ impl App {
             KeyCode::Char('4') => self.state.current_view = CurrentView::BooleanManager,
             KeyCode::Char('5') => self.state.current_view = CurrentView::RollbackHistory,
             KeyCode::Char('6') => self.state.current_view = CurrentView::SafeSettings,
+            KeyCode::Char('7') => self.state.current_view = CurrentView::FileContexts,
+            KeyCode::Char('8') => self.state.current_view = CurrentView::Ports,
             _ => {}
         }
         Ok(())
@@ -182,6 +198,8 @@ impl App {
                 CurrentView::BooleanManager => self.handle_boolean_selection(selected)?,
                 CurrentView::RollbackHistory => self.handle_rollback_selection(selected)?,
                 CurrentView::SafeSettings => self.handle_safe_settings_selection(selected)?,
+                CurrentView::FileContexts => self.handle_file_context_selection(selected)?,
+                CurrentView::Ports => self.handle_port_selection(selected)?,
             }
         }
         Ok(())
@@ -194,6 +212,8 @@ impl App {
             2 => self.state.current_view = CurrentView::BooleanManager,
             3 => self.state.current_view = CurrentView::SafeSettings,
             4 => self.state.current_view = CurrentView::RollbackHistory,
+            5 => self.state.current_view = CurrentView::FileContexts,
+            6 => self.state.current_view = CurrentView::Ports,
             _ => {}
         }
         Ok(())
@@ -203,267 +223,168 @@ impl App {
         if let Some(alert) = self.avc_manager.alerts.get(selected) {
             let solution = self.avc_manager.analyze_avc(alert);
             if let Some(sol) = solution {
-                if self.simulation_mode {
-                    self.set_status(format!("[SIM] Would apply solution: {}", sol.description), Color::Yellow);
-                } else {
-                    // Реализовать применение решения
-                    self.set_status(format!("Applied solution: {}", sol.description), Color::Green);
-                }
+                let previous_state = self.get_current_system_state()?;
+                self.avc_manager.apply_solution(&sol, self.simulation_mode)?;
+                let new_state = self.get_current_system_state()?;
+                let rollback_commands = sol.commands.iter().map(|c| self.reverse_command(c)).collect();
+                self.rollback_manager.record_change(
+                    "AVC Solution".to_string(),
+                                                    sol.description.clone(),
+                                                    previous_state,
+                                                    new_state,
+                                                    rollback_commands,
+                );
+
+                self.set_status(format!("Applied solution: {}", sol.description), Color::Green);
             }
         }
         Ok(())
     }
 
-    fn handle_module_selection(&mut self, selected: usize) -> Result<()> {
-        // Копируем нужные данные до начала изменений
-        let module_info = if let Some(module) = self.module_manager.modules.get(selected) {
-            Some((module.name.clone(), module.enabled))
+    fn reverse_command(&self, cmd: &str) -> String {
+        if cmd.contains("setsebool") {
+            cmd.replace("1", "temp").replace("0", "1").replace("temp", "0")
+        } else if cmd.contains("semodule -i") {
+            cmd.replace("-i", "-r")
         } else {
-            None
-        };
+            "".to_string()
+        }
+    }
 
-        if let Some((module_name, was_enabled)) = module_info {
-            let previous_state = self.capture_system_state();
-
-            if was_enabled {
-                if self.simulation_mode {
-                    self.set_status(format!("[SIM] Would disable module: {}", module_name), Color::Yellow);
-                } else {
-                    self.module_manager.disable_module(&module_name)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    let new_state = self.capture_system_state();
-                    self.rollback_manager.record_change(
-                        "module_disable".to_string(),
-                                                        format!("Disabled module: {}", module_name),
-                                                            previous_state,
-                                                        new_state,
-                                                        vec![format!("semodule -e {}", module_name)],
-                    );
-                    self.set_status(format!("Disabled module: {}", module_name), Color::Green);
-                }
+    fn handle_module_selection(&mut self, selected: usize) -> Result<()> {
+        if let Some(module) = self.module_manager.modules.get(selected).cloned() {
+            let previous_state = self.get_current_system_state()?;
+            let rollback_command = format!("semodule {} {}", if module.enabled { "-d" } else { "-e" }, module.name);
+            if module.enabled {
+                self.module_manager.disable_module(&module.name, self.simulation_mode)?;
             } else {
-                if self.simulation_mode {
-                    self.set_status(format!("[SIM] Would enable module: {}", module_name), Color::Yellow);
-                } else {
-                    self.module_manager.enable_module(&module_name)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    let new_state = self.capture_system_state();
-                    self.rollback_manager.record_change(
-                        "module_enable".to_string(),
-                                                        format!("Enabled module: {}", module_name),
-                                                            previous_state,
-                                                        new_state,
-                                                        vec![format!("semodule -d {}", module_name)],
-                    );
-                    self.set_status(format!("Enabled module: {}", module_name), Color::Green);
-                }
+                self.module_manager.enable_module(&module.name, self.simulation_mode)?;
             }
-            self.refresh_data()?;
+            let new_state = self.get_current_system_state()?;
+            let rollback_commands = vec![rollback_command];
+            self.rollback_manager.record_change(
+                "Module Toggle".to_string(),
+                                                format!("Toggled module {}", module.name),
+                                                    previous_state,
+                                                new_state,
+                                                rollback_commands,
+            );
         }
         Ok(())
     }
 
     fn handle_boolean_selection(&mut self, selected: usize) -> Result<()> {
-        // Копируем нужные данные до начала изменений
-        let boolean_info = if let Some(boolean) = self.boolean_manager.booleans.get(selected) {
-            Some((boolean.name.clone(), boolean.current_value))
-        } else {
-            None
-        };
-
-        if let Some((boolean_name, current_value)) = boolean_info {
-            let previous_state = self.capture_system_state();
-            let new_value = !current_value;
-
-            if self.simulation_mode {
-                self.set_status(
-                    format!("[SIM] Would set boolean {} to {}", boolean_name, new_value),
-                        Color::Yellow,
-                );
-            } else {
-                self.boolean_manager.set_boolean(&boolean_name, new_value)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let new_state = self.capture_system_state();
-                self.rollback_manager.record_change(
-                    "boolean_change".to_string(),
-                                                    format!("Set boolean {} to {}", boolean_name, new_value),
-                                                        previous_state,
-                                                    new_state,
-                                                    vec![format!("setsebool {} {}", boolean_name, current_value)],
-                );
-                self.set_status(
-                    format!("Set boolean {} to {}", boolean_name, new_value),
-                        Color::Green,
-                );
-            }
-            self.refresh_data()?;
+        if let Some(boolean) = self.boolean_manager.booleans.get(selected).cloned() {
+            let previous_state = self.get_current_system_state()?;
+            let rollback_command = format!("setsebool -P {} {}", boolean.name, if boolean.current_value { "off" } else { "on" });
+            self.boolean_manager.set_boolean(&boolean.name, !boolean.current_value, self.simulation_mode)?;
+            let new_state = self.get_current_system_state()?;
+            let rollback_commands = vec![rollback_command];
+            self.rollback_manager.record_change(
+                "Boolean Toggle".to_string(),
+                                                format!("Toggled boolean {}", boolean.name),
+                                                    previous_state,
+                                                new_state,
+                                                rollback_commands,
+            );
         }
         Ok(())
     }
 
     fn handle_rollback_selection(&mut self, selected: usize) -> Result<()> {
-        // Исправляем проблему заимствования: копируем ID до mutable borrow
-        let change_id = if let Some(change) = self.rollback_manager.change_history.get(selected) {
-            change.id.clone()
-        } else {
-            return Ok(());
-        };
-
-        if self.simulation_mode {
-            self.set_status(
-                format!("[SIM] Would rollback change: {}", change_id),
-                    Color::Yellow,
-            );
-        } else {
-            let previous_state = self.capture_system_state();
-            match self.rollback_manager.rollback_to_id(&change_id) {
-                Ok(()) => {
-                    let new_state = self.capture_system_state();
-                    self.rollback_manager.record_change(
-                        "rollback".to_string(),
-                                                        format!("Rolled back change: {}", change_id),
-                                                            previous_state,
-                                                        new_state,
-                                                        vec!["# Manual intervention may be required".to_string()],
-                    );
-                    self.set_status("Successfully rolled back change".to_string(), Color::Green);
-                    self.refresh_data()?;
-                }
-                Err(e) => {
-                    self.set_status(format!("Rollback failed: {}", e), Color::Red);
-                }
-            }
+        if let Some(change) = self.rollback_manager.change_history.get(selected).cloned() {
+            self.rollback_manager.rollback_to_id(&change.id, self.simulation_mode)?;
+            self.set_status(format!("Rolled back to {}", change.timestamp), Color::Yellow);
         }
         Ok(())
     }
 
     fn handle_safe_settings_selection(&mut self, selected: usize) -> Result<()> {
-        match selected {
-            0 => self.apply_safe_settings()?,
-            1 => self.apply_restrictive_policy()?,
-            2 => self.apply_web_hardening()?,
-            3 => self.apply_database_hardening()?,
-            4 => self.apply_user_restrictions()?,
-            _ => {}
+        let previous_state = self.get_current_system_state()?;
+        let rollback_commands = match selected {
+            0 => self.safe_config.apply_safe_defaults(&mut self.boolean_manager, self.simulation_mode)?,
+            1 => self.safe_config.apply_restrictive_policy(&mut self.boolean_manager, self.simulation_mode)?,
+            _ => vec![],
+        };
+        let new_state = self.get_current_system_state()?;
+        self.rollback_manager.record_change(
+            "Safe Settings".to_string(),
+                                            format!("Applied safe profile {}", selected),
+                                                previous_state,
+                                            new_state,
+                                            rollback_commands,
+        );
+        self.set_status("Applied safe settings".to_string(), Color::Green);
+        Ok(())
+    }
+
+    fn handle_file_context_selection(&mut self, selected: usize) -> Result<()> {
+        if let Some(context) = self.file_context_manager.contexts.get(selected).cloned() {
+            let previous_state = self.get_current_system_state()?;
+            let rollback_command = format!("semanage fcontext -a -t {} {}", context.context, context.path);
+            self.file_context_manager.remove_file_context(&context.path, self.simulation_mode)?;
+            let new_state = self.get_current_system_state()?;
+            let rollback_commands = vec![rollback_command];
+            self.rollback_manager.record_change(
+                "File Context Remove".to_string(),
+                                                format!("Removed context for {}", context.path),
+                                                    previous_state,
+                                                new_state,
+                                                rollback_commands,
+            );
+        }
+        Ok(())
+    }
+
+    fn handle_port_selection(&mut self, selected: usize) -> Result<()> {
+        if let Some(port) = self.port_manager.ports.get(selected).cloned() {
+            let previous_state = self.get_current_system_state()?;
+            let rollback_command = format!("semanage port -a -t {} -p {} {}", port.context, port.protocol, port.port);
+            self.port_manager.remove_port(&port.port, &port.protocol, self.simulation_mode)?;
+            let new_state = self.get_current_system_state()?;
+            let rollback_commands = vec![rollback_command];
+            self.rollback_manager.record_change(
+                "Port Remove".to_string(),
+                                                format!("Removed port {}", port.port),
+                                                    previous_state,
+                                                new_state,
+                                                rollback_commands,
+            );
         }
         Ok(())
     }
 
     fn rollback_last_change(&mut self) -> Result<()> {
-        let previous_state = self.capture_system_state();
-        if self.simulation_mode {
-            self.set_status("[SIM] Would rollback last change".to_string(), Color::Yellow);
-        } else {
-            match self.rollback_manager.rollback_last() {
-                Ok(()) => {
-                    let new_state = self.capture_system_state();
-                    self.rollback_manager.record_change(
-                        "rollback".to_string(),
-                                                        "Rolled back last change".to_string(),
-                                                        previous_state,
-                                                        new_state,
-                                                        vec!["# Rollback of rollback - manual intervention required".to_string()],
-                    );
-                    self.set_status("Successfully rolled back last change".to_string(), Color::Green);
-                    self.refresh_data()?;
-                }
-                Err(e) => {
-                    self.set_status(format!("Rollback failed: {}", e), Color::Red);
-                }
-            }
-        }
+        self.rollback_manager.rollback_last(self.simulation_mode)?;
+        self.set_status("Rolled back last change".to_string(), Color::Yellow);
         Ok(())
     }
 
     fn apply_safe_settings(&mut self) -> Result<()> {
-        let previous_state = self.capture_system_state();
-
-        if self.simulation_mode {
-            self.set_status("[SIM] Would apply safe settings".to_string(), Color::Yellow);
-        } else {
-            self.safe_config.apply_safe_defaults(&mut self.boolean_manager)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let new_state = self.capture_system_state();
-
-            let rollback_cmds = self.safe_config.generate_rollback_commands(&previous_state.booleans);
-            self.rollback_manager.record_change(
-                "safe_settings".to_string(),
-                                                "Applied safe security settings".to_string(),
-                                                previous_state,
-                                                new_state,
-                                                rollback_cmds,
-            );
-            self.set_status("Safe settings applied successfully".to_string(), Color::Green);
-            self.refresh_data()?;
-        }
+        let previous_state = self.get_current_system_state()?;
+        let rollback_commands = self.safe_config.apply_safe_defaults(&mut self.boolean_manager, self.simulation_mode)?;
+        let new_state = self.get_current_system_state()?;
+        self.rollback_manager.record_change(
+            "Safe Defaults".to_string(),
+                                            "Applied safe defaults".to_string(),
+                                            previous_state,
+                                            new_state,
+                                            rollback_commands,
+        );
+        self.set_status("Applied safe settings".to_string(), Color::Green);
         Ok(())
     }
 
-    fn apply_restrictive_policy(&mut self) -> Result<()> {
-        let previous_state = self.capture_system_state();
-
-        if self.simulation_mode {
-            self.set_status("[SIM] Would apply restrictive policy".to_string(), Color::Yellow);
-        } else {
-            self.safe_config.apply_restrictive_policy(&mut self.boolean_manager)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let new_state = self.capture_system_state();
-
-            let rollback_cmds = self.safe_config.generate_rollback_commands(&previous_state.booleans);
-            self.rollback_manager.record_change(
-                "restrictive_policy".to_string(),
-                                                "Applied restrictive policy settings".to_string(),
-                                                previous_state,
-                                                new_state,
-                                                rollback_cmds,
-            );
-            self.set_status("Restrictive policy applied (some functionality may be limited)".to_string(), Color::Green);
-            self.refresh_data()?;
-        }
-        Ok(())
-    }
-
-    fn apply_web_hardening(&mut self) -> Result<()> {
-        self.set_status("Web hardening feature not yet implemented".to_string(), Color::Yellow);
-        Ok(())
-    }
-
-    fn apply_database_hardening(&mut self) -> Result<()> {
-        self.set_status("Database hardening feature not yet implemented".to_string(), Color::Yellow);
-        Ok(())
-    }
-
-    fn apply_user_restrictions(&mut self) -> Result<()> {
-        self.set_status("User restrictions feature not yet implemented".to_string(), Color::Yellow);
-        Ok(())
-    }
-
-    fn capture_system_state(&self) -> SystemState {
-        SystemState {
+    fn get_current_system_state(&self) -> Result<SystemState> {
+        let selinux_mode = String::from_utf8_lossy(&std::process::Command::new("getenforce").output()?.stdout).trim().to_string();
+        Ok(SystemState {
             timestamp: Utc::now().to_rfc3339(),
-            selinux_mode: self.get_selinux_mode(),
-            booleans: self.boolean_manager.booleans.clone(),
-            modules: self.module_manager.modules.clone(),
-            file_contexts: vec![],
-            ports: vec![],
-        }
-    }
-
-    fn get_selinux_mode(&self) -> String {
-        if self.simulation_mode {
-            "Enforcing".to_string()
-        } else {
-            String::from_utf8_lossy(
-                &Command::new("getenforce")
-                .output()
-                .unwrap_or_else(|_| Output {
-                    status: std::process::ExitStatus::default(),
-                                stdout: Vec::new(),
-                                stderr: Vec::new(),
-                })
-                .stdout
-            ).trim().to_string()
-        }
+           selinux_mode,
+           booleans: self.boolean_manager.booleans.clone(),
+           modules: self.module_manager.modules.clone(),
+           file_contexts: self.file_context_manager.contexts.iter().map(|c| format!("{}:{}", c.path, c.context)).collect(),
+           ports: self.port_manager.ports.iter().map(|p| format!("{}/{}:{}", p.port, p.protocol, p.context)).collect(),
+        })
     }
 
     fn tick(&mut self) -> Result<()> {
@@ -473,70 +394,60 @@ impl App {
         }
         Ok(())
     }
-}
 
-// Реализация рендеринга UI
-impl App {
-    fn ui<B: Backend>(&self, f: &mut Frame<B>) {
+    fn ui<B: Backend>(&mut self, f: &mut Frame<B>) {
         let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
-                     Constraint::Min(0),    // Main content
-                     Constraint::Length(3), // Footer
+            Constraint::Length(3),
+                     Constraint::Min(0),
+                     Constraint::Length(3),
         ])
         .split(f.size());
 
-        self.render_header(f, chunks[0]);
-        self.render_main_content(f, chunks[1]);
-        self.render_footer(f, chunks[2]);
-    }
-
-    fn render_header<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
-        let titles = vec![
-            " Dashboard ",
-            " AVC Alerts ",
-            " Modules ",
-            " Booleans ",
-            " Rollback ",
-            " Safe Settings ",
-        ];
-
-        let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::ALL).title("SELinux Assistant"))
+        let tabs = Tabs::new(vec![
+            "1: Dashboard",
+            "2: AVC",
+            "3: Modules",
+            "4: Booleans",
+            "5: Rollback",
+            "6: Safe",
+            "7: Files",
+            "8: Ports",
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Views"))
         .select(self.state.current_view as usize)
-        .style(Style::default().fg(Color::Cyan))
-        .highlight_style(
-            Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(Style::default().fg(Color::Yellow));
 
-        f.render_widget(tabs, area);
-    }
+        f.render_widget(tabs, chunks[0]);
 
-    fn render_main_content<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
         match self.state.current_view {
-            CurrentView::Dashboard => self.render_dashboard(f, area),
-            CurrentView::AVCAlerts => self.render_avc_alerts(f, area),
-            CurrentView::ModuleManager => self.render_modules(f, area),
-            CurrentView::BooleanManager => self.render_booleans(f, area),
-            CurrentView::RollbackHistory => self.render_rollback_history(f, area),
-            CurrentView::SafeSettings => self.render_safe_settings(f, area),
+            CurrentView::Dashboard => self.render_dashboard(f, chunks[1]),
+            CurrentView::AVCAlerts => self.render_avc_alerts(f, chunks[1]),
+            CurrentView::ModuleManager => self.render_modules(f, chunks[1]),
+            CurrentView::BooleanManager => self.render_booleans(f, chunks[1]),
+            CurrentView::RollbackHistory => self.render_rollback_history(f, chunks[1]),
+            CurrentView::SafeSettings => self.render_safe_settings(f, chunks[1]),
+            CurrentView::FileContexts => self.render_file_contexts(f, chunks[1]),
+            CurrentView::Ports => self.render_ports(f, chunks[1]),
         }
+
+        self.render_footer(f, chunks[2]);
     }
 
     fn render_dashboard<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
         let items = vec![
-            ListItem::new("📊 AVC Alerts & Denials"),
-            ListItem::new("⚙️  Module Management"),
-            ListItem::new("🔧 Boolean Management"),
-            ListItem::new("🛡️  Safe Security Settings"),
-            ListItem::new("📜 Rollback History"),
+            ListItem::new("AVC Alerts"),
+            ListItem::new("Module Manager"),
+            ListItem::new("Boolean Manager"),
+            ListItem::new("Safe Settings"),
+            ListItem::new("Rollback History"),
+            ListItem::new("File Contexts"),
+            ListItem::new("Ports"),
         ];
 
         let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Quick Access"))
+        .block(Block::default().borders(Borders::ALL).title("Dashboard - Select Section"))
         .highlight_style(Style::default().fg(Color::Yellow))
         .highlight_symbol("➤ ");
 
@@ -544,10 +455,7 @@ impl App {
     }
 
     fn render_avc_alerts<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
-        let items: Vec<ListItem> = self.avc_manager.alerts
-        .iter()
-        .enumerate()
-        .map(|(_i, alert)| {  // Убрали неиспользуемую переменную i
+        let items: Vec<ListItem> = self.avc_manager.alerts.iter().map(|alert| {
             let severity_icon = match alert.severity {
                 AVCSeverity::High => "🔴",
                 AVCSeverity::Medium => "🟡",
@@ -560,8 +468,7 @@ impl App {
                                              Style::default().fg(Color::Gray),
                                      ),
             ]))
-        })
-        .collect();
+        }).collect();
 
         let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(format!("AVC Alerts ({})", self.avc_manager.alerts.len())))
@@ -572,9 +479,7 @@ impl App {
     }
 
     fn render_modules<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
-        let items: Vec<ListItem> = self.module_manager.modules
-        .iter()
-        .map(|module| {
+        let items: Vec<ListItem> = self.module_manager.modules.iter().map(|module| {
             let status = if module.enabled { "✅" } else { "❌" };
             ListItem::new(Line::from(vec![
                 Span::raw(format!("{} {} ", status, module.name)),
@@ -583,8 +488,7 @@ impl App {
                                              Style::default().fg(if module.enabled { Color::Green } else { Color::Red }),
                                      ),
             ]))
-        })
-        .collect();
+        }).collect();
 
         let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("SELinux Modules (Enter to toggle)"))
@@ -595,9 +499,7 @@ impl App {
     }
 
     fn render_booleans<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
-        let items: Vec<ListItem> = self.boolean_manager.booleans
-        .iter()
-        .map(|boolean| {
+        let items: Vec<ListItem> = self.boolean_manager.booleans.iter().map(|boolean| {
             let status = if boolean.current_value { "✅" } else { "❌" };
             let persistent = if boolean.persistent { "💾" } else { " " };
             ListItem::new(Line::from(vec![
@@ -607,8 +509,7 @@ impl App {
                                              Style::default().fg(Color::Gray),
                                      ),
             ]))
-        })
-        .collect();
+        }).collect();
 
         let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("SELinux Booleans (Enter to toggle)"))
@@ -619,9 +520,7 @@ impl App {
     }
 
     fn render_rollback_history<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
-        let items: Vec<ListItem> = self.rollback_manager.change_history
-        .iter()
-        .map(|change| {
+        let items: Vec<ListItem> = self.rollback_manager.change_history.iter().map(|change| {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     &change.timestamp[11..19],
@@ -632,11 +531,10 @@ impl App {
                                      Span::raw(" - "),
                                      Span::raw(&change.description),
             ]))
-        })
-        .collect();
+        }).collect();
 
         let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Change History (Enter to rollback, R for last)"))
+        .block(Block::default().borders(Borders::ALL).title("Change History (Enter to rollback to this point)"))
         .highlight_style(Style::default().fg(Color::Red))
         .highlight_symbol("⤴️ ");
 
@@ -654,9 +552,47 @@ impl App {
         ];
 
         let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Safe Security Profiles"))
+        .block(Block::default().borders(Borders::ALL).title("Safe Security Profiles (Enter to apply)"))
         .highlight_style(Style::default().fg(Color::Green))
         .highlight_symbol("🛡️ ");
+
+        f.render_stateful_widget(list, area, &mut self.state.list_state.clone());
+    }
+
+    fn render_file_contexts<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
+        let items: Vec<ListItem> = self.file_context_manager.contexts.iter().map(|context| {
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{} ", context.path)),
+                                     Span::styled(
+                                         format!("[{}]", context.context),
+                                             Style::default().fg(Color::Cyan),
+                                     ),
+            ]))
+        }).collect();
+
+        let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("File Contexts (Enter to remove)"))
+        .highlight_style(Style::default().fg(Color::Yellow))
+        .highlight_symbol("➤ ");
+
+        f.render_stateful_widget(list, area, &mut self.state.list_state.clone());
+    }
+
+    fn render_ports<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
+        let items: Vec<ListItem> = self.port_manager.ports.iter().map(|port| {
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{} / {} ", port.port, port.protocol)),
+                                     Span::styled(
+                                         format!("[{}]", port.context),
+                                             Style::default().fg(Color::Cyan),
+                                     ),
+            ]))
+        }).collect();
+
+        let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Ports (Enter to remove)"))
+        .highlight_style(Style::default().fg(Color::Yellow))
+        .highlight_symbol("➤ ");
 
         f.render_stateful_widget(list, area, &mut self.state.list_state.clone());
     }
@@ -669,46 +605,44 @@ impl App {
         };
 
         let help_text = match self.state.current_view {
-            CurrentView::Dashboard => "↑↓: Navigate • Enter: Select • 1-6: Switch tabs • Q: Quit",
-            CurrentView::AVCAlerts => "↑↓: Navigate • Enter: Analyze • R: Refresh • S: Safe settings",
-            CurrentView::ModuleManager => "↑↓: Navigate • Enter: Toggle • R: Rollback last",
-            CurrentView::BooleanManager => "↑↓: Navigate • Enter: Toggle • R: Refresh",
-            CurrentView::RollbackHistory => "↑↓: Navigate • Enter: Rollback • R: Rollback last",
+            CurrentView::Dashboard => "↑↓: Navigate • Enter: Select • 1-8: Switch tabs • Q: Quit",
+            CurrentView::AVCAlerts => "↑↓: Navigate • Enter: Analyze & Apply • R: Refresh • S: Safe settings",
+            CurrentView::ModuleManager => "↑↓: Navigate • Enter: Toggle • r: Rollback last",
+            CurrentView::BooleanManager => "↑↓: Navigate • Enter: Toggle • R: Refreshsending",
+            CurrentView::RollbackHistory => "↑↓: Navigate • Enter: Rollback to point • r: Rollback last",
             CurrentView::SafeSettings => "↑↓: Navigate • Enter: Apply • R: Refresh",
+            CurrentView::FileContexts => "↑↓: Navigate • Enter: Remove • R: Refresh",
+            CurrentView::Ports => "↑↓: Navigate • Enter: Remove • R: Refresh",
         };
 
-        let mut footer_text = format!("{}{}", mode_indicator, help_text);
+        let footer_text = format!("{}{}", mode_indicator, help_text);
 
-        if let Some((message, color)) = &self.status_message {
-            footer_text = format!("{} | Status: {}", footer_text, message);
-            let paragraph = Paragraph::new(footer_text)
+        let paragraph = if let Some((message, color)) = &self.status_message {
+            Paragraph::new(format!("{} | Status: {}", footer_text, message))
             .style(Style::default().fg(*color))
-            .block(Block::default().borders(Borders::ALL));
-            f.render_widget(paragraph, area);
+            .block(Block::default().borders(Borders::ALL))
         } else {
-            let paragraph = Paragraph::new(footer_text)
+            Paragraph::new(footer_text)
             .style(Style::default().fg(Color::Gray))
-            .block(Block::default().borders(Borders::ALL));
-            f.render_widget(paragraph, area);
-        }
+            .block(Block::default().borders(Borders::ALL))
+        };
+
+        f.render_widget(paragraph, area);
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Настройка терминала
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Создание приложения
     let mut app = App::new(cli.simulate, cli.debug)?;
     let result = run_app(&mut terminal, &mut app);
 
-    // Восстановление терминала
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
