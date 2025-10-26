@@ -8,6 +8,8 @@ pub enum CurrentView {
     BooleanManager,
     RollbackHistory,
     SafeSettings,
+    FileContexts,
+    Ports,
 }
 
 impl CurrentView {
@@ -18,18 +20,22 @@ impl CurrentView {
             Self::ModuleManager => Self::BooleanManager,
             Self::BooleanManager => Self::RollbackHistory,
             Self::RollbackHistory => Self::SafeSettings,
-            Self::SafeSettings => Self::Dashboard,
+            Self::SafeSettings => Self::FileContexts,
+            Self::FileContexts => Self::Ports,
+            Self::Ports => Self::Dashboard,
         }
     }
 
     pub fn previous(&self) -> Self {
         match self {
-            Self::Dashboard => Self::SafeSettings,
+            Self::Dashboard => Self::Ports,
             Self::AVCAlerts => Self::Dashboard,
             Self::ModuleManager => Self::AVCAlerts,
             Self::BooleanManager => Self::ModuleManager,
             Self::RollbackHistory => Self::BooleanManager,
             Self::SafeSettings => Self::RollbackHistory,
+            Self::FileContexts => Self::SafeSettings,
+            Self::Ports => Self::FileContexts,
         }
     }
 }
@@ -81,14 +87,15 @@ impl AppState {
     }
 
     fn get_current_item_count(&self) -> usize {
-        // Заглушка - в реальности зависит от данных в текущем виде
         match self.current_view {
-            CurrentView::Dashboard => 5,
+            CurrentView::Dashboard => 7,
             CurrentView::AVCAlerts => 10,
             CurrentView::ModuleManager => 8,
             CurrentView::BooleanManager => 12,
             CurrentView::RollbackHistory => 6,
             CurrentView::SafeSettings => 6,
+            CurrentView::FileContexts => 10,
+            CurrentView::Ports => 10,
         }
     }
 }
