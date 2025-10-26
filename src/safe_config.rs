@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use anyhow::Result;
 use super::booleans::{BooleanManager, BooleanState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,8 +24,8 @@ impl Default for SafeModeConfig {
 }
 
 impl SafeModeConfig {
-    pub fn apply_safe_defaults(&self, boolean_manager: &mut BooleanManager) -> Result<(), Box<dyn std::error::Error>> {
-        // Применение безопасных настроек
+    pub fn apply_safe_defaults(&self, boolean_manager: &mut BooleanManager, simulation: bool) -> Result<Vec<String>> {
+        let previous_booleans = boolean_manager.booleans.clone();
         let safe_booleans = vec![
             ("httpd_read_user_content", false),
             ("httpd_enable_homedirs", false),
@@ -32,13 +33,14 @@ impl SafeModeConfig {
         ];
 
         for (name, value) in safe_booleans {
-            boolean_manager.set_boolean(name, value)?;
+            boolean_manager.set_boolean(name, value, simulation)?;
         }
-        Ok(())
+
+        Ok(self.generate_rollback_commands(&previous_booleans))
     }
 
-    pub fn apply_restrictive_policy(&self, boolean_manager: &mut BooleanManager) -> Result<(), Box<dyn std::error::Error>> {
-        // Применение ограничительной политики
+    pub fn apply_restrictive_policy(&self, boolean_manager: &mut BooleanManager, simulation: bool) -> Result<Vec<String>> {
+        let previous_booleans = boolean_manager.booleans.clone();
         let restrictive_booleans = vec![
             ("deny_ptrace", true),
             ("deny_execmem", true),
@@ -47,16 +49,17 @@ impl SafeModeConfig {
 
         for (name, value) in restrictive_booleans {
             if boolean_manager.booleans.iter().any(|b| b.name == name) {
-                boolean_manager.set_boolean(name, value)?;
+                boolean_manager.set_boolean(name, value, simulation)?;
             }
         }
-        Ok(())
+
+        Ok(self.generate_rollback_commands(&previous_booleans))
     }
 
     pub fn generate_rollback_commands(&self, previous_booleans: &[BooleanState]) -> Vec<String> {
         previous_booleans
         .iter()
-        .map(|b| format!("setsebool {} {}", b.name, b.current_value))
+        .map(|b| format!("setsebool -P {} {}", b.name, if b.current_value { "on" } else { "off" }))
         .collect()
     }
 }
