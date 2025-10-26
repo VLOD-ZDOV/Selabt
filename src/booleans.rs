@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::process::Command;
+use anyhow::Result;
+use regex::Regex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BooleanState {
@@ -18,8 +21,38 @@ impl BooleanManager {
         Self { booleans: Vec::new() }
     }
 
-    pub fn load_booleans(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Реализация загрузки boolean'ов
+    pub fn load_booleans(&mut self) -> Result<()> {
+        let output = Command::new("getsebool")
+        .arg("-a")
+        .output()?
+        .stdout;
+
+        let logs = String::from_utf8_lossy(&output);
+        let re = Regex::new(r"^(.*?)\s-->\s(on|off)$")?;
+
+        self.booleans.clear();
+        for line in logs.lines() {
+            if let Some(cap) = re.captures(line) {
+                let name = cap[1].to_string();
+                let value = cap[2].to_string() == "on";
+
+                let desc_output = Command::new("semanage")
+                .args(&["boolean", "-l"])
+                .output()?
+                .stdout;
+                let desc_logs = String::from_utf8_lossy(&desc_output);
+                let desc_re = Regex::new(&format!(r"{}\s+\((on|off),\s(on|off)\)\s+(.*)", regex::escape(&name)))?;
+                let description = desc_re.captures(&desc_logs).map_or("No description".to_string(), |c| c[3].to_string());
+
+                self.booleans.push(BooleanState {
+                    name,
+                    description,
+                    current_value: value,
+                    persistent: true,
+                    default_value: value,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -42,8 +75,21 @@ impl BooleanManager {
         ];
     }
 
-    pub fn set_boolean(&mut self, name: &str, value: bool) -> Result<(), Box<dyn std::error::Error>> {
-        // Реализация изменения boolean'а
+    pub fn set_boolean(&mut self, name: &str, value: bool, simulation: bool) -> Result<()> {
+        if simulation {
+            if let Some(boolean) = self.booleans.iter_mut().find(|b| b.name == name) {
+                boolean.current_value = value;
+            }
+            return Ok(());
+        }
+
+        let flag = if value { "on" } else { "off" };
+        Command::new("setsebool")
+        .arg("-P")
+        .arg(name)
+        .arg(flag)
+        .output()?;
+
         if let Some(boolean) = self.booleans.iter_mut().find(|b| b.name == name) {
             boolean.current_value = value;
         }
