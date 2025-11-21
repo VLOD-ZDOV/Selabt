@@ -29,6 +29,7 @@ pub struct ChangeRecord {
     pub applied_commands: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct RollbackManager {
     pub change_history: VecDeque<ChangeRecord>,
     pub max_history: usize,

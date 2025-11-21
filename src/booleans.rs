@@ -13,6 +13,7 @@ pub struct BooleanState {
     pub default_value: bool,
 }
 
+#[derive(Clone)]
 pub struct BooleanManager {
     pub booleans: Vec<BooleanState>,
 }

@@ -22,6 +22,7 @@ pub enum AVCSeverity {
     Low,
 }
 
+#[derive(Clone)]
 pub struct AVCManager {
     pub alerts: Vec<AVCAlert>,
 }

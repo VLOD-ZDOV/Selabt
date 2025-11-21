@@ -56,6 +56,7 @@ impl CurrentView {
     }
 }
 
+#[derive(Clone)]
 pub struct AppState {
     pub current_view: CurrentView,
     pub list_state: ListState,
@@ -67,7 +68,7 @@ pub struct AppState {
     pub popup_type: PopupType,
     pub input_buffer: String, // Буфер для ввода текста
     pub input_cursor_position: usize,
-    pub search_query: String, // Текущий поисковый запрос
+    pub search_query: String, // Текущый поисковый запрос
 }
 
 impl AppState {
