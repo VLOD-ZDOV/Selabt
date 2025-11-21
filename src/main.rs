@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
 use crossterm::{
-    event::{self, KeyCode},
+    event::{self, KeyCode, EnableMouseCapture, DisableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -22,7 +22,6 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
-    process::Command,
 };
 
 mod avc;
@@ -62,7 +61,8 @@ struct Cli {
     ascii: bool,
 }
 
-#[derive(Clone)]  // <<< ОБЯЗАТЕЛЬНО добавь это в booleans.rs и safe_config.rs тоже!
+// App struct cannot derive Clone because Receiver doesn't implement Clone
+// We'll implement Clone manually, excluding the Receiver field
 struct App {
     state: AppState,
     avc_manager: AVCManager,
@@ -83,6 +83,34 @@ struct App {
     spinner_idx: usize,
     pending_rx: Option<Receiver<TaskResult>>,
     logfile_path: Option<PathBuf>,
+    advisor: advisor::Advisor,
+}
+
+impl Clone for App {
+    fn clone(&self) -> Self {
+        App {
+            state: self.state.clone(),
+            avc_manager: self.avc_manager.clone(),
+            module_manager: self.module_manager.clone(),
+            boolean_manager: self.boolean_manager.clone(),
+            rollback_manager: self.rollback_manager.clone(),
+            safe_config: self.safe_config.clone(),
+            file_context_manager: self.file_context_manager.clone(),
+            port_manager: self.port_manager.clone(),
+            last_update: self.last_update,
+            update_interval: self.update_interval,
+            should_quit: self.should_quit,
+            status_message: self.status_message.clone(),
+            debug_mode: self.debug_mode,
+            simulation_mode: self.simulation_mode,
+            ascii_mode: self.ascii_mode,
+            is_busy: self.is_busy,
+            spinner_idx: self.spinner_idx,
+            pending_rx: None, // Receiver cannot be cloned, so set to None
+            logfile_path: self.logfile_path.clone(),
+            advisor: advisor::Advisor::new(), // Create a new advisor instance
+        }
+    }
 }
 
 struct TaskResult {
@@ -114,6 +142,7 @@ impl App {
             spinner_idx: 0,
             pending_rx: None,
             logfile_path: None,
+            advisor: advisor::Advisor::new(),
         };
 
         app.refresh_data()?;
