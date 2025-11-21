@@ -10,6 +10,7 @@ pub struct SELinuxModule {
     pub priority: i32,
 }
 
+#[derive(Clone)]
 pub struct ModuleManager {
     pub modules: Vec<SELinuxModule>,
 }

@@ -9,6 +9,7 @@ pub struct FileContext {
     pub context: String,
 }
 
+#[derive(Clone)]
 pub struct FileContextManager {
     pub contexts: Vec<FileContext>,
 }

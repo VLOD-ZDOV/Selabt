@@ -10,6 +10,7 @@ pub struct PortContext {
     pub context: String,
 }
 
+#[derive(Clone)]
 pub struct PortManager {
     pub ports: Vec<PortContext>,
 }

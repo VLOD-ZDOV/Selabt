@@ -26,33 +26,29 @@ impl Default for SafeModeConfig {
 impl SafeModeConfig {
     pub fn apply_safe_defaults(&self, boolean_manager: &mut BooleanManager, simulation: bool) -> Result<Vec<String>> {
         let previous_booleans = boolean_manager.booleans.clone();
-        let safe_booleans = vec![
-            ("httpd_read_user_content", false),
-            ("httpd_enable_homedirs", false),
-            ("allow_ssh_keysign", false),
+        let safe_booleans: Vec<(String, bool)> = vec![
+            ("httpd_read_user_content".to_string(), false),
+            ("httpd_enable_homedirs".to_string(), false),
+            ("allow_ssh_keysign".to_string(), false),
         ];
-
-        for (name, value) in safe_booleans {
-            boolean_manager.set_boolean(name, value, simulation)?;
-        }
-
+        boolean_manager.set_booleans_persistent(&safe_booleans, simulation)?;
         Ok(self.generate_rollback_commands(&previous_booleans))
     }
 
     pub fn apply_restrictive_policy(&self, boolean_manager: &mut BooleanManager, simulation: bool) -> Result<Vec<String>> {
         let previous_booleans = boolean_manager.booleans.clone();
-        let restrictive_booleans = vec![
-            ("deny_ptrace", true),
-            ("deny_execmem", true),
-            ("secure_mode", true),
+        let restrictive_booleans_raw = vec![
+            ("deny_ptrace".to_string(), true),
+            ("deny_execmem".to_string(), true),
+            ("secure_mode".to_string(), true),
         ];
-
-        for (name, value) in restrictive_booleans {
-            if boolean_manager.booleans.iter().any(|b| b.name == name) {
-                boolean_manager.set_boolean(name, value, simulation)?;
-            }
+        let restrictive_booleans: Vec<(String, bool)> = restrictive_booleans_raw
+            .into_iter()
+            .filter(|(name, _)| boolean_manager.booleans.iter().any(|b| b.name == *name))
+            .collect();
+        if !restrictive_booleans.is_empty() {
+            boolean_manager.set_booleans_persistent(&restrictive_booleans, simulation)?;
         }
-
         Ok(self.generate_rollback_commands(&previous_booleans))
     }
 
@@ -72,6 +68,7 @@ pub struct SecurityProfile {
     pub risk_level: RiskLevel,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RiskLevel {
     Low,

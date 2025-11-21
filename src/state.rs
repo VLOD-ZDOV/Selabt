@@ -12,6 +12,22 @@ pub enum CurrentView {
     Ports,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputMode {
+    Normal,
+    Editing, // Пользователь вводит текст
+    Search,  // Пользователь ищет
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PopupType {
+    None,
+    AddPort,
+    AddFileContext,
+    Help(String), // Показать справку по конкретному ключу
+    Search,
+}
+
 impl CurrentView {
     pub fn next(&self) -> Self {
         match self {
@@ -40,10 +56,19 @@ impl CurrentView {
     }
 }
 
+#[derive(Clone)]
 pub struct AppState {
     pub current_view: CurrentView,
     pub list_state: ListState,
     pub selected_index: Option<usize>,
+    pub current_items_len: usize,
+
+    // Новые поля
+    pub input_mode: InputMode,
+    pub popup_type: PopupType,
+    pub input_buffer: String, // Буфер для ввода текста
+    pub input_cursor_position: usize,
+    pub search_query: String, // Текущый поисковый запрос
 }
 
 impl AppState {
@@ -54,7 +79,42 @@ impl AppState {
             current_view: CurrentView::Dashboard,
             list_state,
             selected_index: Some(0),
+            current_items_len: 0,
+            input_mode: InputMode::Normal,
+            popup_type: PopupType::None,
+            input_buffer: String::new(),
+            input_cursor_position: 0,
+            search_query: String::new(),
         }
+    }
+
+    pub fn set_current_len(&mut self, len: usize) {
+        self.current_items_len = len;
+        // Подстрахуемся: если выбранный индекс вышел за предел, вернем его к последнему элементу
+        if let Some(sel) = self.list_state.selected() {
+            if sel >= self.current_items_len.saturating_sub(1) && self.current_items_len > 0 {
+                self.list_state.select(Some(self.current_items_len.saturating_sub(1)));
+                self.selected_index = self.list_state.selected();
+            }
+        }
+    }
+
+    pub fn enter_input_mode(&mut self, popup: PopupType) {
+        self.input_mode = InputMode::Editing;
+        self.popup_type = popup;
+        self.input_buffer.clear();
+        self.input_cursor_position = 0;
+    }
+
+    pub fn enter_search_mode(&mut self) {
+        self.input_mode = InputMode::Search;
+        self.popup_type = PopupType::Search;
+        self.input_buffer.clear();
+    }
+
+    pub fn reset_mode(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.popup_type = PopupType::None;
     }
 
     pub fn next_view(&mut self) {
@@ -87,15 +147,6 @@ impl AppState {
     }
 
     fn get_current_item_count(&self) -> usize {
-        match self.current_view {
-            CurrentView::Dashboard => 7,
-            CurrentView::AVCAlerts => 10,
-            CurrentView::ModuleManager => 8,
-            CurrentView::BooleanManager => 12,
-            CurrentView::RollbackHistory => 6,
-            CurrentView::SafeSettings => 6,
-            CurrentView::FileContexts => 10,
-            CurrentView::Ports => 10,
-        }
+        self.current_items_len
     }
 }
