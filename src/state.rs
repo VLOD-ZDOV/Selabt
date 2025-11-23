@@ -10,6 +10,29 @@ pub enum CurrentView {
     SafeSettings,
     FileContexts,
     Ports,
+    Statistics,
+    SELinuxMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputMode {
+    Normal,
+    Editing, // Пользователь вводит текст
+    Search,  // Пользователь ищет
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PopupType {
+    None,
+    AddPort,
+    AddFileContext,
+    Help(String), // Показать справку по конкретному ключу
+    Search,
+    DetailView(String), // Детальная информация об элементе
+    ExportConfig,
+    ImportConfig,
+    AVCRecommendations,
+    CreateModule, // Создание модуля из AVC
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,13 +61,15 @@ impl CurrentView {
             Self::RollbackHistory => Self::SafeSettings,
             Self::SafeSettings => Self::FileContexts,
             Self::FileContexts => Self::Ports,
-            Self::Ports => Self::Dashboard,
+            Self::Ports => Self::Statistics,
+            Self::Statistics => Self::SELinuxMode,
+            Self::SELinuxMode => Self::Dashboard,
         }
     }
 
     pub fn previous(&self) -> Self {
         match self {
-            Self::Dashboard => Self::Ports,
+            Self::Dashboard => Self::SELinuxMode,
             Self::AVCAlerts => Self::Dashboard,
             Self::ModuleManager => Self::AVCAlerts,
             Self::BooleanManager => Self::ModuleManager,
@@ -52,6 +77,8 @@ impl CurrentView {
             Self::SafeSettings => Self::RollbackHistory,
             Self::FileContexts => Self::SafeSettings,
             Self::Ports => Self::FileContexts,
+            Self::Statistics => Self::Ports,
+            Self::SELinuxMode => Self::Statistics,
         }
     }
 }
