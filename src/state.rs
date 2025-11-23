@@ -35,22 +35,6 @@ pub enum PopupType {
     CreateModule, // Создание модуля из AVC
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum InputMode {
-    Normal,
-    Editing, // Пользователь вводит текст
-    Search,  // Пользователь ищет
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum PopupType {
-    None,
-    AddPort,
-    AddFileContext,
-    Help(String), // Показать справку по конкретному ключу
-    Search,
-}
-
 impl CurrentView {
     pub fn next(&self) -> Self {
         match self {

@@ -60,18 +60,3 @@ impl SafeModeConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecurityProfile {
-    pub name: String,
-    pub description: String,
-    pub booleans: Vec<(String, bool)>,
-    pub risk_level: RiskLevel,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RiskLevel {
-    Low,
-    Medium,
-    High,
-}

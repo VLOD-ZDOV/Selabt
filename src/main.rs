@@ -302,7 +302,13 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.show_help_popup(),
             KeyCode::Char('/') => self.state.enter_search_mode(),
-            KeyCode::Char('a') => self.show_add_popup(),
+            KeyCode::Char('a') => {
+                if self.state.current_view == CurrentView::AVCAlerts && !self.avc_recommendations.is_empty() {
+                    self.apply_selected_recommendation()?;
+                } else {
+                    self.show_add_popup();
+                }
+            }
             KeyCode::Enter => self.execute_current_selection()?,
 
             KeyCode::Char('h') | KeyCode::Left => self.state.previous_view(),
@@ -325,6 +331,8 @@ impl App {
             KeyCode::Char('A') => self.show_avc_recommendations(),
             KeyCode::Char('m') => self.show_create_module_popup(),
             KeyCode::Char('M') => self.toggle_selinux_mode(),
+            KeyCode::Char('D') => self.remove_selected_module()?,
+            KeyCode::Char('c') => self.clear_rollback_history()?,
             // Быстрые переходы по цифрам
             KeyCode::Char(c) if c.is_digit(10) => {
                 if let Some(digit) = c.to_digit(10) {
@@ -483,41 +491,65 @@ impl App {
             }
             PopupType::CreateModule => {
                 if input.is_empty() {
-                    self.set_status("Error: Module name required".into(), Color::Red);
+                    self.set_status("Error: Module name or path required".into(), Color::Red);
                     return Ok(());
                 }
                 
-                let module_name = input.clone();
-                let alerts: Vec<_> = if let Some(idx) = self.state.selected_index {
-                    // Создаем модуль из выбранного алерта
-                    if let Some(alert) = self.avc_manager.alerts.get(idx) {
-                        vec![alert.clone()]
-                    } else {
-                        vec![]
-                    }
+                // Проверяем, является ли ввод путем к файлу
+                if input.ends_with(".pp") || input.starts_with("/") {
+                    // Устанавливаем существующий модуль
+                    let module_path = input.clone();
+                    let module_path_for_log = module_path.clone();
+                    let mut module_mgr = self.module_manager.clone();
+                    let sim = self.simulation_mode;
+                    self.state.reset_mode();
+                    
+                    self.spawn_task(&format!("Installing module from {}...", module_path_for_log), move || {
+                        module_mgr.install_module(&module_path, sim)?;
+                        let module_name = std::path::Path::new(&module_path)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let rb = vec![format!("semodule -r {}", module_name)];
+                        Ok((format!("Installed module from {}", module_path), rb))
+                    });
+                    
+                    let _ = self.logger.info(&format!("Installing module from {}", module_path_for_log));
                 } else {
-                    // Создаем модуль из всех алертов
-                    self.avc_manager.alerts.clone()
-                };
-                
-                if alerts.is_empty() {
-                    self.set_status("Error: No AVC alerts to create module from".into(), Color::Red);
-                    return Ok(());
+                    // Создаем модуль из AVC алертов
+                    let module_name = input.clone();
+                    let alerts: Vec<_> = if let Some(idx) = self.state.selected_index {
+                        // Создаем модуль из выбранного алерта
+                        if let Some(alert) = self.avc_manager.alerts.get(idx) {
+                            vec![alert.clone()]
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        // Создаем модуль из всех алертов
+                        self.avc_manager.alerts.clone()
+                    };
+                    
+                    if alerts.is_empty() {
+                        self.set_status("Error: No AVC alerts to create module from".into(), Color::Red);
+                        return Ok(());
+                    }
+                    
+                    let alert_count = alerts.len();
+                    let mut module_mgr = self.module_manager.clone();
+                    let sim = self.simulation_mode;
+                    let log_msg = format!("Creating module {} from {} alerts", module_name, alert_count);
+                    self.state.reset_mode();
+                    
+                    self.spawn_task(&format!("Creating module {}...", module_name), move || {
+                        let result = module_mgr.create_module_from_alerts(&module_name, &alerts, sim)?;
+                        let rb = vec![format!("semodule -r {}", module_name)];
+                        Ok((result, rb))
+                    });
+                    
+                    let _ = self.logger.info(&log_msg);
                 }
-                
-                let alert_count = alerts.len();
-                let mut module_mgr = self.module_manager.clone();
-                let sim = self.simulation_mode;
-                let log_msg = format!("Creating module {} from {} alerts", module_name, alert_count);
-                self.state.reset_mode();
-                
-                self.spawn_task(&format!("Creating module {}...", module_name), move || {
-                    let result = module_mgr.create_module_from_alerts(&module_name, &alerts, sim)?;
-                    let rb = vec![format!("semodule -r {}", module_name)];
-                    Ok((result, rb))
-                });
-                
-                let _ = self.logger.info(&log_msg);
             }
             _ => self.state.reset_mode(),
         }
@@ -552,7 +584,7 @@ impl App {
                     // Показываем рекомендацию если есть
                     if let Some(advice) = self.advisor.get_module_advice(&module.name) {
                         let detail = format!(
-                            "Module: {}\n\n{}\n\nRisk: {}\nSuggestion: {}\n\nPress Enter again to toggle.",
+                            "Module: {}\n\n{}\n\nRisk: {}\nSuggestion: {}\n\nPress Enter again to toggle.\nPress 'd' to remove module.",
                             module.name, advice.description, advice.risk, advice.suggestion
                         );
                         self.state.popup_type = PopupType::DetailView(detail);
@@ -632,10 +664,22 @@ impl App {
             CurrentView::AVCAlerts => {
                 if let Some(alert) = self.avc_manager.alerts.get(selected).cloned() {
                     if let Some(sol) = self.avc_manager.analyze_avc(&alert) {
+                        // Показываем детали решения с module_content
+                        let detail = format!(
+                            "AVC Solution:\n\n{}\n\nModule Content:\n{}\n\nCommands:\n{}\n\nPress Enter again to apply.",
+                            sol.description,
+                            if sol.module_content.is_empty() { "N/A" } else { &sol.module_content },
+                            sol.commands.join("\n")
+                        );
+                        self.state.popup_type = PopupType::DetailView(detail);
+                        self.state.input_mode = InputMode::Editing;
+                        
+                        // Сохраняем решение для применения при повторном нажатии Enter
                         let mgr = self.avc_manager.clone();
                         let sim = self.simulation_mode;
                         let sol_clone = sol.clone();
-
+                        
+                        // Применяем при повторном Enter
                         self.spawn_task("Applying AVC Fix...", move || {
                             mgr.apply_solution(&sol_clone, sim)?;
                             let rb = sol_clone
@@ -646,6 +690,38 @@ impl App {
                             Ok((format!("Applied: {}", sol_clone.description), rb))
                         });
                     }
+                }
+            }
+            CurrentView::SafeSettings => {
+                match selected {
+                    0 => self.apply_safe_settings_async()?,
+                    1 => self.apply_restrictive_policy_async()?,
+                    _ => {}
+                }
+            }
+            CurrentView::RollbackHistory => {
+                if let Some(change) = self.rollback_manager.change_history.get(selected).cloned() {
+                    // Показываем детали и предлагаем откат
+                    let detail = format!(
+                        "Change Details:\n\nID: {}\nTimestamp: {}\nAction: {}\nDescription: {}\n\nRollback Commands:\n{}\n\nPress Enter again to rollback to this change.",
+                        change.id,
+                        change.timestamp,
+                        change.action,
+                        change.description,
+                        change.rollback_commands.join("\n")
+                    );
+                    self.state.popup_type = PopupType::DetailView(detail);
+                    self.state.input_mode = InputMode::Editing;
+                    
+                    // При повторном Enter - откатываем
+                    let mut mgr = self.rollback_manager.clone();
+                    let sim = self.simulation_mode;
+                    let change_id = change.id.clone();
+                    
+                    self.spawn_task(&format!("Rolling back to {}...", change_id), move || {
+                        mgr.rollback_to_id(&change_id, sim)?;
+                        Ok((format!("Rolled back to {}", change_id), vec![]))
+                    });
                 }
             }
             _ => {}
@@ -706,6 +782,18 @@ impl App {
         self.spawn_task("Applying Safe Defaults...", move || {
             let rb = safe.apply_safe_defaults(&mut mgr, sim)?;
             Ok(("Applied safe defaults".to_string(), rb))
+        });
+        Ok(())
+    }
+    
+    fn apply_restrictive_policy_async(&mut self) -> Result<()> {
+        let safe = self.safe_config.clone();
+        let mut mgr = self.boolean_manager.clone();
+        let sim = self.simulation_mode;
+
+        self.spawn_task("Applying Restrictive Policy...", move || {
+            let rb = safe.apply_restrictive_policy(&mut mgr, sim)?;
+            Ok(("Applied restrictive policy".to_string(), rb))
         });
         Ok(())
     }
@@ -803,6 +891,85 @@ impl App {
         }
         self.state.popup_type = PopupType::AVCRecommendations;
         self.state.input_mode = InputMode::Editing;
+    }
+    
+    fn apply_selected_recommendation(&mut self) -> Result<()> {
+        if let Some(idx) = self.state.selected_index {
+            if let Some(rec) = self.avc_recommendations.get(idx) {
+                let _ = self.logger.warn(&format!("Applying recommendation: {}", rec.title));
+                
+                match rec.action_type.as_str() {
+                    "boolean" => {
+                        if let Some(value) = &rec.action_value {
+                            let mut mgr = self.boolean_manager.clone();
+                            let sim = self.simulation_mode;
+                            let bool_name = rec.action_key.clone();
+                            let bool_value = value == "on" || value == "true";
+                            
+                            self.spawn_task(&format!("Applying boolean {}...", bool_name), move || {
+                                mgr.set_boolean(&bool_name, bool_value, sim)?;
+                                let rb = format!("setsebool -P {} {}", bool_name, if !bool_value { "on" } else { "off" });
+                                Ok((format!("Applied boolean {}", bool_name), vec![rb]))
+                            });
+                        }
+                    }
+                    "file_context" => {
+                        if let Some(context) = &rec.action_value {
+                            let mut mgr = self.file_context_manager.clone();
+                            let sim = self.simulation_mode;
+                            let path = rec.action_key.clone();
+                            let ctx = context.clone();
+                            
+                            self.spawn_task(&format!("Adding file context {}...", path), move || {
+                                mgr.add_file_context(&path, &ctx, sim)?;
+                                let rb = format!("semanage fcontext -d {}", path);
+                                Ok((format!("Added context for {}", path), vec![rb]))
+                            });
+                        }
+                    }
+                    _ => {
+                        self.set_status("Recommendation type not yet implemented".into(), Color::Yellow);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    fn remove_selected_module(&mut self) -> Result<()> {
+        if self.state.current_view == CurrentView::ModuleManager {
+            if let Some(idx) = self.state.selected_index {
+                if let Some(module) = self.module_manager.modules.get(idx).cloned() {
+                    let mut mgr = self.module_manager.clone();
+                    let sim = self.simulation_mode;
+                    let module_name = module.name.clone();
+                    let module_name_for_log = module_name.clone();
+                    let module_name_for_rb = module_name.clone();
+                    
+                    self.spawn_task(&format!("Removing module {}...", module_name_for_log), move || {
+                        mgr.remove_module(&module_name, sim)?;
+                        let rb = format!("semodule -i {}", module_name_for_rb);
+                        Ok((format!("Removed module {}", module_name), vec![rb]))
+                    });
+                    
+                    let _ = self.logger.warn(&format!("Removing module {}", module_name_for_log));
+                }
+            }
+        } else {
+            self.set_status("Remove module only available in Module Manager view".into(), Color::Yellow);
+        }
+        Ok(())
+    }
+    
+    fn clear_rollback_history(&mut self) -> Result<()> {
+        if self.state.current_view == CurrentView::RollbackHistory {
+            self.rollback_manager.clear_history()?;
+            self.set_status("Rollback history cleared".into(), Color::Green);
+            let _ = self.logger.warn("Rollback history cleared by user");
+        } else {
+            self.set_status("Clear history only available in Rollback History view".into(), Color::Yellow);
+        }
+        Ok(())
     }
     
     fn get_filtered_avc_alerts(&self) -> Vec<avc::AVCAlert> {
@@ -945,8 +1112,13 @@ impl App {
         let area = self.centered_rect(40, 20, f.size());
         f.render_widget(Clear, area);
 
-        let spinner_chars = ["|", "/", "-", "\\"];
-        let spin = spinner_chars[self.spinner_idx % spinner_chars.len()];
+        let spin = if self.ascii_mode {
+            let spinner_chars = ["|", "/", "-", "\\"];
+            spinner_chars[self.spinner_idx % 4]
+        } else {
+            let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            spinner_chars[self.spinner_idx % 10]
+        };
 
         let block = Block::default()
         .borders(Borders::ALL)
@@ -1004,6 +1176,12 @@ impl App {
                 // Показываем рекомендуемые контексты если пользователь начал вводить путь
                 if let Some(path_part) = self.state.input_buffer.split_whitespace().next() {
                     if !path_part.is_empty() {
+                        // Используем get_file_context_advice для детальной рекомендации
+                        if let Some(advice) = self.advisor.get_file_context_advice(path_part) {
+                            txt.push_str(&format!("💡 Recommendation: {}\n", advice.suggestion));
+                            txt.push_str(&format!("Suggested context: {}\n\n", advice.description));
+                        }
+                        
                         let suggested = self.advisor.get_suggested_file_contexts(path_part);
                         if !suggested.is_empty() {
                             txt.push_str("💡 Suggested contexts:\n");
@@ -1057,15 +1235,25 @@ impl App {
             }
             PopupType::AVCRecommendations => {
                 let text: Vec<Line> = self.avc_recommendations.iter()
-                    .map(|r| Line::from(vec![
-                        Span::styled(format!("{}\n", r.title), Style::default().fg(Color::Yellow)),
-                        Span::raw(format!("{}\n", r.description)),
-                        Span::styled(format!("Risk: {}\n\n", r.risk), Style::default().fg(Color::Cyan)),
-                    ]))
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let is_selected = self.state.selected_index.map(|idx| idx == i).unwrap_or(false);
+                        let style = if is_selected {
+                            Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::Yellow)
+                        };
+                        Line::from(vec![
+                            Span::styled(format!("{}\n", r.title), style),
+                            Span::raw(format!("{}\n", r.description)),
+                            Span::styled(format!("Risk: {} | Type: {} | Key: {}\n", r.risk, r.action_type, r.action_key), Style::default().fg(Color::Cyan)),
+                            Span::raw("\n"),
+                        ])
+                    })
                     .collect();
                 f.render_widget(
                     Paragraph::new(text)
-                    .block(block.title("AVC Recommendations"))
+                    .block(block.title("AVC Recommendations (Press 'a' to apply selected)"))
                     .wrap(Wrap { trim: true }),
                                 area,
                 );
@@ -1080,13 +1268,15 @@ impl App {
                 } else {
                     format!("Will use all {} alerts", self.avc_manager.alerts.len())
                 };
+                let help_text = "\n\nOr enter path to .pp file to install existing module\nExample: /path/to/mymodule.pp";
                 f.render_widget(
                     Paragraph::new(format!(
-                        "Create Module from AVC Alerts\n\n{}\n\nEnter module name:\n> {}",
+                        "Create Module from AVC Alerts{}\n\n{}\n\nEnter module name or path:\n> {}",
+                        help_text,
                         selected_info,
                         self.state.input_buffer
                     ))
-                    .block(block.title("Create Module")),
+                    .block(block.title("Create/Install Module")),
                                 area,
                 );
             }
@@ -1328,11 +1518,11 @@ impl App {
         .rollback_manager
         .change_history
         .iter()
-        .map(|c| ListItem::new(format!("{} - {}", c.timestamp, c.description)))
+        .map(|c| ListItem::new(format!("[{}] {} - {}", c.id, c.timestamp, c.description)))
         .collect();
         f.render_stateful_widget(
             List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("History"))
+            .block(Block::default().borders(Borders::ALL).title("History (Press 'c' to clear, 'r' to rollback to selected)"))
             .highlight_style(Style::default().fg(Color::Yellow)),
                                  area,
                                  &mut self.state.list_state,
@@ -1340,12 +1530,12 @@ impl App {
     }
     fn render_safe<B: Backend>(&mut self, f: &mut Frame<B>, area: Rect) {
         let items = vec![
-            ListItem::new("Apply Safe Defaults"),
-            ListItem::new("Apply Restrictive Policy"),
+            ListItem::new("1. Apply Safe Defaults"),
+            ListItem::new("2. Apply Restrictive Policy"),
         ];
         f.render_stateful_widget(
             List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Safe Config"))
+            .block(Block::default().borders(Borders::ALL).title("Safe Config (Press Enter to apply)"))
             .highlight_style(Style::default().fg(Color::Yellow)),
                                  area,
                                  &mut self.state.list_state,
@@ -1362,7 +1552,7 @@ impl App {
         let msg = if self.is_busy {
             "Working..."
         } else {
-            "?:Help /:Search a:Add m:Module M:Mode e:Export i:Import v:Details f:Filter A:Recs q:Quit"
+            "?:Help /:Search a:Add/Apply m:Module M:Mode e:Export i:Import v:Details f:Filter A:Recs D:Delete c:Clear q:Quit"
         };
         let color = if self
         .status_message
